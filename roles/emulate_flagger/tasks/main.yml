@@ -1,6 +1,7 @@
 - name: Set deployment names
   set_fact:
     target_deployment: "{{ app_name }}-green"
+    fallback_deployment: "{{ app_name }}-blue"
   when: strategy == 'bluegreen'
 
 - name: Set deployment names for canary
@@ -8,6 +9,21 @@
     target_deployment: "{{ app_name }}-canary"
   when: strategy == 'canary'
 
+# Capture current Service selector for rollback (blue/green)
+- name: Get current Service selector
+  kubernetes.core.k8s_info:
+    kind: Service
+    namespace: "{{ namespace }}"
+    name: "{{ service_name }}"
+  register: service_info
+  when: strategy == 'bluegreen'
+
+- name: Set current app selector for rollback
+  set_fact:
+    current_selector: "{{ service_info.resources[0].spec.selector.app }}"
+  when: strategy == 'bluegreen'
+
+# Deploy the new version (canary/green)
 - name: Deploy new version (create or update)
   kubernetes.core.k8s:
     state: present
@@ -48,36 +64,60 @@
   set_fact:
     pod_name: "{{ (pod_info.resources | selectattr('status.phase', 'equalto', 'Running') | list)[0].metadata.name }}"
 
-- name: Run health check on new pod
+- name: Run initial health check on new pod
   shell: |
     kubectl exec -n {{ namespace }} {{ pod_name }} -- curl -sf http://localhost:{{ healthcheck_port }}{{ healthcheck_path }}
   register: health_check
   failed_when: health_check.rc != 0
 
-- name: Blue/Green: Switch service selector
-  kubernetes.core.k8s:
-    kind: Service
-    name: "{{ service_name }}"
-    namespace: "{{ namespace }}"
-    merge_type: strategic-merge
-    definition:
-      spec:
-        selector:
-          app: "{{ target_deployment }}"
+# ---------------- BLUE/GREEN FLOW ----------------
+- block:
+    - name: Switch service selector to green
+      kubernetes.core.k8s:
+        kind: Service
+        name: "{{ service_name }}"
+        namespace: "{{ namespace }}"
+        merge_type: strategic-merge
+        definition:
+          spec:
+            selector:
+              app: "{{ target_deployment }}"
+
+    - name: Wait a bit to let traffic shift
+      pause:
+        seconds: 15
+
+    - name: Verify health after traffic switch
+      shell: |
+        kubectl exec -n {{ namespace }} {{ pod_name }} -- curl -sf http://localhost:{{ healthcheck_port }}{{ healthcheck_path }}
+      register: post_switch_health
+      failed_when: post_switch_health.rc != 0
+
+    - name: Scale down old blue deployment
+      kubernetes.core.k8s_scale:
+        kind: Deployment
+        name: "{{ fallback_deployment }}"
+        namespace: "{{ namespace }}"
+        replicas: 0
+  rescue:
+    - name: ROLLBACK: Restore Service to previous selector
+      kubernetes.core.k8s:
+        kind: Service
+        name: "{{ service_name }}"
+        namespace: "{{ namespace }}"
+        merge_type: strategic-merge
+        definition:
+          spec:
+            selector:
+              app: "{{ current_selector }}"
+    - name: Fail the play (rollback done)
+      fail:
+        msg: "Blue/green deployment failed health check. Rolled back to previous version."
   when: strategy == 'bluegreen'
 
-- name: Blue/Green: Scale down old deployment
-  kubernetes.core.k8s_scale:
-    kind: Deployment
-    name: "{{ app_name }}-blue"
-    namespace: "{{ namespace }}"
-    replicas: 0
-  when: strategy == 'bluegreen'
-
-# Canary-specific tasks
-- name: Canary: Gradually shift traffic
-  block:
-    - name: Loop over traffic weights
+# ---------------- CANARY FLOW ----------------
+- block:
+    - name: Canary: Loop over traffic weights
       with_items: "{{ traffic_weights }}"
       loop_control:
         loop_var: weight
@@ -97,22 +137,37 @@
           pause:
             seconds: 30
 
-        - name: Run health check at each step
+        - name: Run health check at each traffic weight
           shell: |
             kubectl exec -n {{ namespace }} {{ pod_name }} -- curl -sf http://localhost:{{ healthcheck_port }}{{ healthcheck_path }}
           register: health_check_step
           failed_when: health_check_step.rc != 0
-  when: strategy == 'canary'
 
-- name: Canary: Cleanup (set canary weight to 0 after rollout)
-  kubernetes.core.k8s:
-    kind: Ingress
-    name: "{{ ingress_name }}"
-    namespace: "{{ namespace }}"
-    merge_type: strategic-merge
-    definition:
-      metadata:
-        annotations:
-          nginx.ingress.kubernetes.io/canary: "false"
-          nginx.ingress.kubernetes.io/canary-weight: "0"
+    - name: Canary: Cleanup (reset canary to 0 after success)
+      kubernetes.core.k8s:
+        kind: Ingress
+        name: "{{ ingress_name }}"
+        namespace: "{{ namespace }}"
+        merge_type: strategic-merge
+        definition:
+          metadata:
+            annotations:
+              nginx.ingress.kubernetes.io/canary: "false"
+              nginx.ingress.kubernetes.io/canary-weight: "0"
+  rescue:
+    - name: ROLLBACK: Reset ingress canary to 0%
+      kubernetes.core.k8s:
+        kind: Ingress
+        name: "{{ ingress_name }}"
+        namespace: "{{ namespace }}"
+        merge_type: strategic-merge
+        definition:
+          metadata:
+            annotations:
+              nginx.ingress.kubernetes.io/canary: "false"
+              nginx.ingress.kubernetes.io/canary-weight: "0"
+
+    - name: Fail the play (rollback done)
+      fail:
+        msg: "Canary deployment failed health check. Traffic rolled back to 0%."
   when: strategy == 'canary'
