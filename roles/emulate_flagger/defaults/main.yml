@@ -1,0 +1,9 @@
+app_name: my-app
+namespace: default
+strategy: bluegreen  # or 'canary'
+new_image: myrepo/my-app:new-tag
+service_name: "{{ app_name }}-svc"
+ingress_name: "{{ app_name }}-ingress"
+healthcheck_path: "/health"
+healthcheck_port: 8080
+traffic_weights: [10, 30, 50, 100]  # Only used for canary
