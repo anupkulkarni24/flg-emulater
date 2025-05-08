@@ -1,0 +1,118 @@
+- name: Set deployment names
+  set_fact:
+    target_deployment: "{{ app_name }}-green"
+  when: strategy == 'bluegreen'
+
+- name: Set deployment names for canary
+  set_fact:
+    target_deployment: "{{ app_name }}-canary"
+  when: strategy == 'canary'
+
+- name: Deploy new version (create or update)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "{{ target_deployment }}"
+        namespace: "{{ namespace }}"
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: "{{ target_deployment }}"
+        template:
+          metadata:
+            labels:
+              app: "{{ target_deployment }}"
+          spec:
+            containers:
+              - name: "{{ app_name }}"
+                image: "{{ new_image }}"
+                ports:
+                  - containerPort: "{{ healthcheck_port }}"
+
+- name: Wait for rollout to complete
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ namespace }}"
+    label_selectors:
+      - "app={{ target_deployment }}"
+  register: pod_info
+  until: pod_info.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+  retries: 20
+  delay: 10
+
+- name: Get first pod name
+  set_fact:
+    pod_name: "{{ (pod_info.resources | selectattr('status.phase', 'equalto', 'Running') | list)[0].metadata.name }}"
+
+- name: Run health check on new pod
+  shell: |
+    kubectl exec -n {{ namespace }} {{ pod_name }} -- curl -sf http://localhost:{{ healthcheck_port }}{{ healthcheck_path }}
+  register: health_check
+  failed_when: health_check.rc != 0
+
+- name: Blue/Green: Switch service selector
+  kubernetes.core.k8s:
+    kind: Service
+    name: "{{ service_name }}"
+    namespace: "{{ namespace }}"
+    merge_type: strategic-merge
+    definition:
+      spec:
+        selector:
+          app: "{{ target_deployment }}"
+  when: strategy == 'bluegreen'
+
+- name: Blue/Green: Scale down old deployment
+  kubernetes.core.k8s_scale:
+    kind: Deployment
+    name: "{{ app_name }}-blue"
+    namespace: "{{ namespace }}"
+    replicas: 0
+  when: strategy == 'bluegreen'
+
+# Canary-specific tasks
+- name: Canary: Gradually shift traffic
+  block:
+    - name: Loop over traffic weights
+      with_items: "{{ traffic_weights }}"
+      loop_control:
+        loop_var: weight
+      tasks:
+        - name: Set ingress canary annotations
+          kubernetes.core.k8s:
+            kind: Ingress
+            name: "{{ ingress_name }}"
+            namespace: "{{ namespace }}"
+            merge_type: strategic-merge
+            definition:
+              metadata:
+                annotations:
+                  nginx.ingress.kubernetes.io/canary: "true"
+                  nginx.ingress.kubernetes.io/canary-weight: "{{ weight }}"
+        - name: Wait between traffic shifts
+          pause:
+            seconds: 30
+
+        - name: Run health check at each step
+          shell: |
+            kubectl exec -n {{ namespace }} {{ pod_name }} -- curl -sf http://localhost:{{ healthcheck_port }}{{ healthcheck_path }}
+          register: health_check_step
+          failed_when: health_check_step.rc != 0
+  when: strategy == 'canary'
+
+- name: Canary: Cleanup (set canary weight to 0 after rollout)
+  kubernetes.core.k8s:
+    kind: Ingress
+    name: "{{ ingress_name }}"
+    namespace: "{{ namespace }}"
+    merge_type: strategic-merge
+    definition:
+      metadata:
+        annotations:
+          nginx.ingress.kubernetes.io/canary: "false"
+          nginx.ingress.kubernetes.io/canary-weight: "0"
+  when: strategy == 'canary'
