@@ -1,0 +1,8 @@
+- hosts: localhost
+  roles:
+    - role: emulate_flagger
+      vars:
+        app_name: my-app
+        namespace: default
+        strategy: bluegreen  # or 'canary'
+        new_image: myrepo/my-app:new-tag
