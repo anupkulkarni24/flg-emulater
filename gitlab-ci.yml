@@ -1,0 +1,17 @@
+stages:
+  - deploy
+
+deploy-to-aks:
+  stage: deploy
+  image: bitnami/ansible:latest  # Or a custom image with ansible + kubernetes.core
+  script:
+    - echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig
+    - export KUBECONFIG=$PWD/kubeconfig
+
+    # Install Ansible collection if not baked into image
+    - ansible-galaxy collection install kubernetes.core
+
+    # Run the playbook
+    - ansible-playbook -e "new_image=myrepo/my-app:${CI_COMMIT_SHA}" deploy.yml
+  only:
+    - main  # Or your chosen branch
