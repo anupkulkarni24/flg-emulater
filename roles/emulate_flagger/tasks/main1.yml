@@ -1,0 +1,79 @@
+- name: Create preview (green/canary) deployment
+  shell: |
+    cat <<EOF | kubectl apply -n {{ namespace }} -f -
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: {{ app_name }}-preview
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: {{ app_name }}
+          track: preview
+      template:
+        metadata:
+          labels:
+            app: {{ app_name }}
+            track: preview
+        spec:
+          containers:
+          - name: {{ app_name }}
+            image: {{ new_image }}
+            ports:
+            - containerPort: 8080
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              initialDelaySeconds: 5
+              periodSeconds: 5
+    EOF
+
+- name: Wait for preview deployment rollout
+  shell: kubectl rollout status deployment/{{ app_name }}-preview -n {{ namespace }}
+  register: rollout_status
+  retries: 10
+  delay: 10
+  until: rollout_status.rc == 0
+
+- name: Run health check on preview pod
+  shell: |
+    POD=$(kubectl get pods -l app={{ app_name }},track=preview -n {{ namespace }} -o jsonpath='{.items[0].metadata.name}')
+    kubectl exec -n {{ namespace }} $POD -- curl -sf http://localhost:8080/health
+  register: health_check
+  ignore_errors: true
+
+- name: Rollback preview deployment if health fails
+  when: health_check.rc != 0
+  shell: |
+    echo "Health check failed. Rolling back preview deployment"
+    kubectl delete deployment {{ app_name }}-preview -n {{ namespace }}
+
+- name: Promote preview to primary if healthy
+  when: health_check.rc == 0
+  shell: |
+    echo "Health check passed. Promoting to primary..."
+    kubectl delete deployment {{ app_name }}-primary -n {{ namespace }} || true
+    kubectl delete svc {{ app_name }} -n {{ namespace }} || true
+
+    # Create Service pointing to new version
+    cat <<EOF | kubectl apply -n {{ namespace }} -f -
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: {{ app_name }}
+    spec:
+      selector:
+        app: {{ app_name }}
+        track: preview
+      ports:
+      - protocol: TCP
+        port: 80
+        targetPort: 8080
+    EOF
+
+    # Rename deployment (patch name and label)
+    kubectl scale deployment {{ app_name }}-preview --replicas=3 -n {{ namespace }}
+    kubectl patch deployment {{ app_name }}-preview -n {{ namespace }} --type=json \
+      -p='[{"op": "replace", "path": "/metadata/name", "value": "{{ app_name }}-primary"}]'
